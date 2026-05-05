@@ -191,6 +191,13 @@ const (
 	// flag for v1.1.0 and will be removed if the behavior proves to be stable enough.
 	ENABLE_PROBES_INJECTION = "ENABLE_PROBES_INJECTION"
 
+	// This environment variable for the KubeRay operator is used to determine whether to enable
+	// the injection of a preStop drain hook into RayService pod containers. The hook calls
+	// `ray drain-node` to gracefully drain the Ray Serve proxy before pod termination, preventing
+	// connection resets on persistent connections during blue/green cluster upgrades. This flag
+	// will be removed once the Ray drain API is stable.
+	ENABLE_SERVE_DRAIN_HOOK_INJECTION = "ENABLE_SERVE_DRAIN_HOOK_INJECTION"
+
 	// This KubeRay operator environment variable is used to determine
 	// if operator should treat OpenShift cluster as Vanilla Kubernetes.
 	USE_INGRESS_ON_OPENSHIFT = "USE_INGRESS_ON_OPENSHIFT"

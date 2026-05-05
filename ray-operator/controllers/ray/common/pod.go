@@ -41,6 +41,13 @@ const (
 	NeuronCoreRayResourceName          = "neuron_cores"
 	TPUContainerResourceName           = "google.com/tpu"
 	TPURayResourceName                 = "TPU"
+
+	// rayServeTerminationGracePeriodSeconds is the default terminationGracePeriodSeconds for
+	// RayService pods. Sized for the default RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S (30s) plus
+	// 30s for the container to exit after SIGTERM. Users who override
+	// RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S must also set terminationGracePeriodSeconds on
+	// their pod template accordingly.
+	rayServeTerminationGracePeriodSeconds = 60
 )
 
 var customAcceleratorToRayResourceMap = map[string]string{
@@ -343,6 +350,13 @@ func getEnableInitContainerInjection() bool {
 
 func getEnableProbesInjection() bool {
 	if s := os.Getenv(utils.ENABLE_PROBES_INJECTION); strings.ToLower(s) == "false" {
+		return false
+	}
+	return true
+}
+
+func getEnableServeDrainHookInjection() bool {
+	if s := os.Getenv(utils.ENABLE_SERVE_DRAIN_HOOK_INJECTION); strings.ToLower(s) == "false" {
 		return false
 	}
 	return true
@@ -666,7 +680,37 @@ func BuildPod(ctx context.Context, podTemplateSpec corev1.PodTemplateSpec, rayNo
 		initLivenessAndReadinessProbe(&pod.Spec.Containers[utils.RayContainerIndex], rayNodeType, creatorCRDType, rayStartParams, rayVersion)
 	}
 
+	// Inject a preStop drain hook for RayService pods to prevent connection resets on
+	// persistent connections during blue/green cluster upgrades.
+	// The feature flag ENABLE_SERVE_DRAIN_HOOK_INJECTION will be removed once the Ray drain API is stable.
+	if creatorCRDType == utils.RayServiceCRD && getEnableServeDrainHookInjection() {
+		injectRayServeDrainHook(&pod)
+	}
+
 	return pod
+}
+
+func injectRayServeDrainHook(pod *corev1.Pod) {
+	rayContainer := &pod.Spec.Containers[utils.RayContainerIndex]
+
+	if rayContainer.Lifecycle == nil {
+		rayContainer.Lifecycle = &corev1.Lifecycle{}
+	}
+	if rayContainer.Lifecycle.PreStop == nil {
+		rayContainer.Lifecycle.PreStop = &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"/bin/sh", "-c",
+					"ray drain-node --reason DRAIN_NODE_REASON_PREEMPTION --reason-message 'Draining Ray Serve proxy for graceful pod termination.' || true; sleep ${RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S:-30}",
+				},
+			},
+		}
+	}
+
+	if pod.Spec.TerminationGracePeriodSeconds == nil {
+		gracePeriod := int64(rayServeTerminationGracePeriodSeconds)
+		pod.Spec.TerminationGracePeriodSeconds = &gracePeriod
+	}
 }
 
 // BuildAutoscalerContainer builds a Ray autoscaler container which can be appended to the head pod.

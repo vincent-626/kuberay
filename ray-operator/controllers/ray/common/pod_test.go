@@ -1011,6 +1011,87 @@ func TestBuildPod_WithCreatedByRayService(t *testing.T) {
 	utils.EnvVarExists(utils.RAY_TIMEOUT_MS_TASK_WAIT_FOR_DEATH_INFO, pod.Spec.Containers[utils.RayContainerIndex].Env)
 }
 
+func TestBuildPod_WithRayServiceDrainHook(t *testing.T) {
+	ctx := context.Background()
+	expectedPreStopCmd := "ray drain-node --reason DRAIN_NODE_REASON_PREEMPTION --reason-message 'Draining Ray Serve proxy for graceful pod termination.' || true; sleep ${RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S:-30}"
+
+	t.Run("RayService worker pod gets drain hook and terminationGracePeriodSeconds injected", func(t *testing.T) {
+		cluster := instance.DeepCopy()
+		worker := cluster.Spec.WorkerGroupSpecs[0]
+		podName := cluster.Name + utils.DashSymbol + string(rayv1.WorkerNode) + utils.DashSymbol + worker.GroupName + utils.DashSymbol + utils.FormatInt32(0)
+		fqdnRayIP := utils.GenerateFQDNServiceName(ctx, *cluster, cluster.Namespace)
+		podTemplateSpec := DefaultWorkerPodTemplate(ctx, *cluster, worker, podName, fqdnRayIP, "6379", "", 0, 0)
+		pod := BuildPod(ctx, podTemplateSpec, rayv1.WorkerNode, worker.RayStartParams, "6379", false, utils.RayServiceCRD, fqdnRayIP, nil, "")
+
+		rayContainer := pod.Spec.Containers[utils.RayContainerIndex]
+		require.NotNil(t, rayContainer.Lifecycle)
+		require.NotNil(t, rayContainer.Lifecycle.PreStop)
+		require.NotNil(t, rayContainer.Lifecycle.PreStop.Exec)
+		assert.Equal(t, []string{"/bin/sh", "-c", expectedPreStopCmd}, rayContainer.Lifecycle.PreStop.Exec.Command)
+		require.NotNil(t, pod.Spec.TerminationGracePeriodSeconds)
+		assert.Equal(t, int64(rayServeTerminationGracePeriodSeconds), *pod.Spec.TerminationGracePeriodSeconds)
+	})
+
+	t.Run("RayService head pod gets drain hook and terminationGracePeriodSeconds injected", func(t *testing.T) {
+		cluster := instance.DeepCopy()
+		podName := strings.ToLower(cluster.Name + utils.DashSymbol + string(rayv1.HeadNode) + utils.DashSymbol + utils.FormatInt32(0))
+		podTemplateSpec := DefaultHeadPodTemplate(ctx, *cluster, cluster.Spec.HeadGroupSpec, podName, "6379")
+		pod := BuildPod(ctx, podTemplateSpec, rayv1.HeadNode, cluster.Spec.HeadGroupSpec.RayStartParams, "6379", false, utils.RayServiceCRD, "", nil, "")
+
+		rayContainer := pod.Spec.Containers[utils.RayContainerIndex]
+		require.NotNil(t, rayContainer.Lifecycle)
+		require.NotNil(t, rayContainer.Lifecycle.PreStop)
+		assert.Equal(t, []string{"/bin/sh", "-c", expectedPreStopCmd}, rayContainer.Lifecycle.PreStop.Exec.Command)
+		require.NotNil(t, pod.Spec.TerminationGracePeriodSeconds)
+		assert.Equal(t, int64(rayServeTerminationGracePeriodSeconds), *pod.Spec.TerminationGracePeriodSeconds)
+	})
+
+	t.Run("non-RayService pod is not affected", func(t *testing.T) {
+		cluster := instance.DeepCopy()
+		podName := strings.ToLower(cluster.Name + utils.DashSymbol + string(rayv1.HeadNode) + utils.DashSymbol + utils.FormatInt32(0))
+		podTemplateSpec := DefaultHeadPodTemplate(ctx, *cluster, cluster.Spec.HeadGroupSpec, podName, "6379")
+		pod := BuildPod(ctx, podTemplateSpec, rayv1.HeadNode, cluster.Spec.HeadGroupSpec.RayStartParams, "6379", false, utils.RayClusterCRD, "", nil, "")
+
+		rayContainer := pod.Spec.Containers[utils.RayContainerIndex]
+		if rayContainer.Lifecycle != nil {
+			assert.Nil(t, rayContainer.Lifecycle.PreStop)
+		}
+		assert.Nil(t, pod.Spec.TerminationGracePeriodSeconds)
+	})
+
+	t.Run("user-specified preStop hook is not overridden", func(t *testing.T) {
+		cluster := instance.DeepCopy()
+		worker := cluster.Spec.WorkerGroupSpecs[0]
+		podName := cluster.Name + utils.DashSymbol + string(rayv1.WorkerNode) + utils.DashSymbol + worker.GroupName + utils.DashSymbol + utils.FormatInt32(0)
+		fqdnRayIP := utils.GenerateFQDNServiceName(ctx, *cluster, cluster.Namespace)
+		podTemplateSpec := DefaultWorkerPodTemplate(ctx, *cluster, worker, podName, fqdnRayIP, "6379", "", 0, 0)
+		customCmd := []string{"/bin/sh", "-c", "my-custom-drain.sh"}
+		podTemplateSpec.Spec.Containers[utils.RayContainerIndex].Lifecycle = &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{Command: customCmd},
+			},
+		}
+		pod := BuildPod(ctx, podTemplateSpec, rayv1.WorkerNode, worker.RayStartParams, "6379", false, utils.RayServiceCRD, fqdnRayIP, nil, "")
+
+		rayContainer := pod.Spec.Containers[utils.RayContainerIndex]
+		assert.Equal(t, customCmd, rayContainer.Lifecycle.PreStop.Exec.Command)
+	})
+
+	t.Run("user-specified terminationGracePeriodSeconds is not overridden", func(t *testing.T) {
+		cluster := instance.DeepCopy()
+		worker := cluster.Spec.WorkerGroupSpecs[0]
+		podName := cluster.Name + utils.DashSymbol + string(rayv1.WorkerNode) + utils.DashSymbol + worker.GroupName + utils.DashSymbol + utils.FormatInt32(0)
+		fqdnRayIP := utils.GenerateFQDNServiceName(ctx, *cluster, cluster.Namespace)
+		podTemplateSpec := DefaultWorkerPodTemplate(ctx, *cluster, worker, podName, fqdnRayIP, "6379", "", 0, 0)
+		customGracePeriod := int64(120)
+		podTemplateSpec.Spec.TerminationGracePeriodSeconds = &customGracePeriod
+		pod := BuildPod(ctx, podTemplateSpec, rayv1.WorkerNode, worker.RayStartParams, "6379", false, utils.RayServiceCRD, fqdnRayIP, nil, "")
+
+		require.NotNil(t, pod.Spec.TerminationGracePeriodSeconds)
+		assert.Equal(t, int64(120), *pod.Spec.TerminationGracePeriodSeconds)
+	})
+}
+
 func TestBuildPod_WithLoginBash(t *testing.T) {
 	tests := []struct {
 		name            string
